@@ -205,8 +205,14 @@ def mock_story(project_id: str):
         p.outline=f"围绕「{p.premise or p.title}」展开：起因、发展、冲突、结局。"
         panels=db.scalars(select(Panel).where(Panel.project_id==p.id).order_by(Panel.sequence)).all()
         arcs=["交代人物与故事背景","人物产生互动","矛盾逐渐升级","转折并完成结局"]
+        demo_lines=["今天又要开始新任务了！","我已经做好准备了！","等等，怎么会这样？","原来是个误会，解决了！"]
+        cast=db.scalars(select(Character).where(Character.project_id==p.id).order_by(Character.name)).all()
         for i,panel in enumerate(panels):
             panel.scene=f"{arcs[min(3,math.floor(i*4/len(panels)))]}；主题：{p.premise or p.title}"
+            exists=db.scalars(select(Dialogue).where(Dialogue.panel_id==panel.id)).first()
+            if not exists:
+                speaker=cast[i%len(cast)].id if cast else None
+                db.add(Dialogue(id=str(uuid4()),panel_id=panel.id,speaker_id=speaker,text=demo_lines[min(3,math.floor(i*4/len(panels)))]))
         return snapshot(db,project_id)
 
 @app.patch("/api/panels/{panel_id}")
