@@ -59,6 +59,18 @@ def test_story_review_apply_and_no_overwrite(monkeypatch):
         assert client.post(f'/api/story-drafts/{latest["id"]}/apply').status_code==409
         assert client.get(f'/api/projects/{pid}').json()['panels'][0]['dialogues'][0]['text']==fake['panels'][0]['dialogues'][0]['text']
         assert calls[0][1]['headers']['Authorization']=="Bearer secret-stays-on-server"
+        other=client.post('/api/projects',json={'title':'手工分镜不可覆盖','panel_count':4}).json()
+        panel_id=client.get(f'/api/projects/{other["id"]}').json()['panels'][0]['id']
+        assert client.patch(f'/api/panels/{panel_id}',json={'scene':'原创故事：不能覆盖'}).status_code==200
+        changed_story=story_fixture(["大小姐","大橘司机"])
+        # No characters created in the second project; use all-null cast for valid generated draft.
+        changed_story["panels"]=[{**entry,"dialogues":[{"speaker_name":None,"text":"原始分镜保护"}]} for entry in changed_story["panels"]]
+        def manual_story_post(url,**kwargs):
+            return httpx.Response(200,json={"choices":[{"message":{"content":json.dumps(changed_story,ensure_ascii=False)}}]})
+        monkeypatch.setattr(ai_pipeline.httpx,"post",manual_story_post)
+        draft2=client.post(f'/api/projects/{other["id"]}/story:ai').json()
+        assert client.post(f'/api/story-drafts/{draft2["id"]}/apply').status_code==409
+        assert client.get(f'/api/projects/{other["id"]}').json()['panels'][0]['scene']=='原创故事：不能覆盖'
 
 
 def test_image_generation_candidate_and_reference_edits(monkeypatch):
