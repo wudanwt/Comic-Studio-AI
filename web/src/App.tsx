@@ -168,8 +168,8 @@ export default function App() {
         <div className="preview-wrap"><img key={revision} src={'/api/projects/'+current.project.id+'/export.svg?v='+revision} alt="合成效果预览" /></div>
         <p className="hint">当前提供固定网格和位置参数编辑。拖拽式画布、图层与可视化气泡尾巴将在后续版本提供。</p>
       </section>}
-      {nav==='settings'&&<section className="surface"><h2><Settings size={20}/> 模型接入与运行状态</h2><AIStatusPanel/><div className="readout"><strong>当前生成模式：Mock（本地示例）</strong><p>本版本无需图像 API Key，手工上传图片并进行确定性中文排版。</p><p>已提供真实 LLM 和 Images API 模型适配器，可通过服务端环境变量连接；ComfyUI 与 GPU Worker 尚未接入。</p></div><h3>计划中的模型能力</h3><div className="chapter-list">{['结构化剧本模型：需配置环境变量','生图接口：需配置环境变量与参考模式','局部重绘：角色与画面修正','多Worker任务队列与进度追踪'].map(x=><div className="chapter" key={x}><span>待开发</span>{x}</div>)}</div></section>}
-      <footer>Comic Studio AI · v0.1 单用户开发版 · 未配置登录与访问控制，请仅在本机或可信网络使用。</footer>
+      {nav==='settings'&&<section className="surface"><h2><Settings size={20}/> 模型接入与运行状态</h2><AIStatusPanel/><div className="readout"><strong>运行模式：离线 Mock / 已配置的真实模型</strong><p>不配置模型时仍可上传画格图片或生成 Mock 插画；配置后可使用真实 AI 剧本与画格生成。</p><p>已提供真实 LLM 和 Images API 模型适配器，可通过服务端环境变量连接；ComfyUI 与 GPU Worker 尚未接入。</p></div><h3>计划中的模型能力</h3><div className="chapter-list">{['结构化剧本模型：需配置环境变量','生图接口：需配置环境变量与参考模式','局部重绘：角色与画面修正','多Worker任务队列与进度追踪'].map(x=><div className="chapter" key={x}><span>待开发</span>{x}</div>)}</div></section>}
+      <footer>Comic Studio AI · v0.2 单用户开发版 · 未配置登录与访问控制，请仅在本机或可信网络使用。</footer>
     </main>
   </div>;
 }
