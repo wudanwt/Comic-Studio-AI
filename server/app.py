@@ -228,9 +228,12 @@ def check_geometry(d):
 
 @app.post("/api/panels/{panel_id}/dialogues",status_code=201)
 def add_dialogue(panel_id: str,data:DialogueIn):
-    check_geometry(data)
     with SessionLocal.begin() as db:
         p=require(db,Panel,panel_id)
+        if "y" not in data.model_fields_set:
+            existing=db.scalars(select(Dialogue).where(Dialogue.panel_id==panel_id)).all()
+            data.y=.06+.30*len(existing)
+        check_geometry(data)
         if data.speaker_id:
             c=require(db,Character,data.speaker_id)
             if c.project_id!=p.project_id:raise HTTPException(422,"speaker from different project")
