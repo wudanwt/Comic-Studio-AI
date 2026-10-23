@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image, UnidentifiedImageError
 from providers import MockImageProvider, provider_manifest
+import ai_pipeline
 from pydantic import BaseModel, Field
 from sqlalchemy import ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -84,6 +85,20 @@ class Asset(Base):
     content_hash: Mapped[str] = mapped_column(String(64))
     mime: Mapped[str] = mapped_column(String(50), default="image/png")
     created_at: Mapped[str] = mapped_column(String(40))
+
+class StoryDraft(Base):
+    __tablename__ = "story_drafts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    payload: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
+class ImageGenerateIn(BaseModel):
+    character_ids: list[str] = Field(default_factory=list, max_length=8)
+    prompt_override: str = Field(default="", max_length=2000)
+
 
 class ProjectIn(BaseModel):
     title: str = Field(min_length=1, max_length=160)
@@ -154,6 +169,154 @@ def snapshot(db: Session, project_id: str):
 @app.get("/api/providers")
 def list_providers():
     return provider_manifest()
+
+@app.get("/api/ai/status")
+def get_ai_status():
+    return ai_pipeline.capability_status()
+
+
+@app.post("/api/projects/{project_id}/story:ai", status_code=201)
+def generate_story_draft(project_id: str):
+    """Generate a reviewable draft; never overwrite any existing project content."""
+    with SessionLocal() as db:
+        p=require(db,Project,project_id)
+        cast=db.scalars(select(Character).where(Character.project_id==p.id).order_by(Character.name)).all()
+        req=(p.title,p.premise,p.style,p.panel_count,[
+            {"name":c.name,"appearance":c.appearance,"personality":c.personality} for c in cast
+        ])
+    try:
+        draft=ai_pipeline.story_draft(*req)
+    except ai_pipeline.AIProviderError as exc:
+        raise HTTPException(502,str(exc)) from exc
+    with SessionLocal.begin() as db:
+        require(db,Project,project_id)
+        record=StoryDraft(id=str(uuid4()),project_id=project_id,payload=json.dumps(draft,ensure_ascii=False),
+                          created_at=now(),status="pending")
+        db.add(record)
+        return {"id":record.id,"project_id":project_id,"status":record.status,"draft":draft}
+
+
+@app.get("/api/projects/{project_id}/story-drafts")
+def get_story_drafts(project_id: str):
+    with SessionLocal() as db:
+        require(db,Project,project_id)
+        drafts=db.scalars(select(StoryDraft).where(StoryDraft.project_id==project_id).order_by(StoryDraft.created_at.desc())).all()
+        return [{"id":d.id,"status":d.status,"created_at":d.created_at,"draft":json.loads(d.payload)} for d in drafts]
+
+
+@app.post("/api/story-drafts/{draft_id}/apply")
+def apply_story_draft(draft_id: str):
+    """Atomic approval. Prevent accidental loss of user/Mock scripts."""
+    with SessionLocal.begin() as db:
+        draft=require(db,StoryDraft,draft_id)
+        project=require(db,Project,draft.project_id)
+        if draft.status!="pending":
+            raise HTTPException(409,"Story draft already applied")
+        panels=db.scalars(select(Panel).where(Panel.project_id==project.id).order_by(Panel.sequence)).all()
+        if len(panels)!=project.panel_count:
+            raise HTTPException(409,"Project panel count changed")
+        existing=db.scalars(select(Dialogue).where(Dialogue.panel_id.in_([p.id for p in panels]))).all()
+        if existing:
+            raise HTTPException(409,"Project has existing dialogue; use a new project to apply AI draft without data loss")
+        if project.outline.strip() or any(p.scene != f"第{p.sequence}格：待设计" or p.camera != "中景" for p in panels):
+            raise HTTPException(409,"Project has manually planned story content; refusing to overwrite it")
+        payload=json.loads(draft.payload)
+        cast=db.scalars(select(Character).where(Character.project_id==project.id)).all()
+        name_to_id={c.name:c.id for c in cast}
+        for panel,proposed in zip(panels,payload["panels"]):
+            if panel.sequence!=proposed["sequence"]:
+                raise HTTPException(409,"Panel sequence mismatch")
+            panel.scene=proposed["scene"]
+            panel.camera=proposed["camera"]
+            for j,line in enumerate(proposed["dialogues"]):
+                speaker_name=line["speaker_name"]
+                if speaker_name is not None and speaker_name not in name_to_id:
+                    raise HTTPException(409,"Character roster changed since draft generation")
+                # 2 bubbles in distinct upper/lower slots without overlap.
+                db.add(Dialogue(id=str(uuid4()),panel_id=panel.id,speaker_id=name_to_id.get(speaker_name),
+                                text=line["text"],y=.06+j*.30))
+        project.outline=payload["outline"]
+        project.updated_at=now()
+        draft.status="applied"
+        return {"project_id":project.id,"draft_id":draft.id,"status":draft.status}
+
+
+@app.post("/api/characters/{character_id}/reference",status_code=201)
+async def set_character_reference(character_id: str,file:UploadFile=File(...)):
+    with SessionLocal() as db:
+        character=require(db,Character,character_id)
+        project_id=character.project_id
+    raw=await file.read(ai_pipeline.MAX_IMAGE_BYTES+1)
+    try:
+        normalized=ai_pipeline.normalize_png(raw)
+    except ai_pipeline.AIProviderError as exc:
+        raise HTTPException(415,str(exc)) from exc
+    asset_id=str(uuid4())
+    filename=f"{asset_id}.png"
+    (ASSET_DIR/filename).write_bytes(normalized)
+    with SessionLocal.begin() as db:
+        character=require(db,Character,character_id)
+        if character.project_id!=project_id:
+            raise HTTPException(409,"Character changed project")
+        db.add(Asset(id=asset_id,project_id=project_id,panel_id=None,path=filename,
+                     content_hash=sha256(normalized).hexdigest(),created_at=now()))
+        character.reference_asset_id=asset_id
+        return {"character_id":character_id,"reference_asset_id":asset_id}
+
+
+@app.get("/api/panels/{panel_id}/candidates")
+def get_panel_candidates(panel_id: str):
+    with SessionLocal() as db:
+        panel=require(db,Panel,panel_id)
+        assets=db.scalars(select(Asset).where(Asset.panel_id==panel.id).order_by(Asset.created_at.desc())).all()
+        return [{"id":a.id,"url":f"/api/assets/{a.id}",
+                 "approved":a.id==panel.approved_asset_id,"created_at":a.created_at} for a in assets]
+
+
+@app.post("/api/panels/{panel_id}/generate:ai",status_code=201)
+def generate_ai_panel(panel_id: str, data:ImageGenerateIn):
+    """Generate a candidate only. Approval is always explicit."""
+    with SessionLocal() as db:
+        panel=require(db,Panel,panel_id)
+        project=require(db,Project,panel.project_id)
+        if len(set(data.character_ids))!=len(data.character_ids):
+            raise HTTPException(422,"Duplicate character IDs")
+        if data.character_ids:
+            characters=[require(db,Character,cid) for cid in data.character_ids]
+            if any(c.project_id!=project.id for c in characters):
+                raise HTTPException(422,"Character from another project")
+        else:
+            characters=db.scalars(select(Character).where(Character.project_id==project.id).order_by(Character.name)).all()
+        cast=[{"name":c.name,"appearance":c.appearance,"personality":c.personality} for c in characters]
+        refs=[]
+        if ai_pipeline.reference_mode()=="edits":
+            for c in characters:
+                if c.reference_asset_id:
+                    asset=require(db,Asset,c.reference_asset_id)
+                    if asset.project_id!=project.id or asset.panel_id is not None:
+                        raise HTTPException(422,"Invalid character reference")
+                    image_path=ASSET_DIR/asset.path
+                    if not image_path.is_file():
+                        raise HTTPException(422,"Character reference file is missing")
+                    refs.append(image_path.read_bytes())
+            if len(refs)>3:
+                raise HTTPException(422,"Maximum 3 character reference images per request")
+        prompt=ai_pipeline.build_panel_prompt(panel.scene,panel.camera,project.style,cast,data.prompt_override)
+        project_id=project.id
+    try:
+        image_bytes=ai_pipeline.image_candidate(prompt,refs)
+    except ai_pipeline.AIProviderError as exc:
+        raise HTTPException(502,str(exc)) from exc
+    asset_id=str(uuid4())
+    filename=f"{asset_id}.png"
+    (ASSET_DIR/filename).write_bytes(image_bytes)
+    with SessionLocal.begin() as db:
+        require(db,Panel,panel_id)
+        db.add(Asset(id=asset_id,project_id=project_id,panel_id=panel_id,path=filename,
+                     content_hash=sha256(image_bytes).hexdigest(),created_at=now()))
+    return {"id":asset_id,"panel_id":panel_id,"approved":False,
+            "reference_count":len(refs),"provider":"image-api"}
+
 
 @app.get("/api/health")
 def health():

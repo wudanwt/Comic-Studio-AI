@@ -16,6 +16,14 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://comic:${POSTGRES_PASSWORD:-local-development-only}@db:5432/comic_studio
       ASSET_DIR: /data/assets
+      STORY_API_BASE_URL: ${STORY_API_BASE_URL:-}
+      STORY_MODEL: ${STORY_MODEL:-}
+      STORY_API_KEY: ${STORY_API_KEY:-}
+      IMAGE_API_BASE_URL: ${IMAGE_API_BASE_URL:-}
+      IMAGE_MODEL: ${IMAGE_MODEL:-}
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
+      IMAGE_REFERENCE_MODE: ${IMAGE_REFERENCE_MODE:-off}
+      IMAGE_SIZE: ${IMAGE_SIZE:-1536x1024}
     volumes:
       - asset_data:/data/assets
     depends_on:
