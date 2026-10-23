@@ -19,6 +19,11 @@ def test_story_panel_text_export_isolation():
         c=client.post(f'/api/projects/{pid}/characters',json={'name':'大小姐','appearance':'布偶猫','personality':'傲娇'}).json()
         plan=client.post(f'/api/projects/{pid}/story:mock').json()
         assert len(plan['panels'])==4
+        assert all(panel['dialogues'] for panel in plan['panels'])
+        first_text=plan['panels'][0]['dialogues'][0]['text']
+        replay=client.post(f'/api/projects/{pid}/story:mock').json()
+        assert replay['panels'][0]['dialogues'][0]['text']==first_text
+        assert len(replay['panels'][0]['dialogues'])==1
         panel=plan['panels'][2]
         d=client.post(f'/api/panels/{panel["id"]}/dialogues',json={'text':'今天怎么又迟到了？','speaker_id':c['id']}).json()
         assert client.post(f'/api/dialogues/{d["id"]}/lock').status_code==200
