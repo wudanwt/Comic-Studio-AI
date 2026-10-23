@@ -84,7 +84,7 @@ def test_image_generation_candidate_and_reference_edits(monkeypatch):
         assert asset['reference_count']==1 and not asset['approved']
         assert calls[0][0].endswith("/images/edits")
         assert 'files' in calls[0][1]
-        assert '不要出现任何中文' in calls[0][1]['form']['prompt'] or '绝对不要出现任何中文' in calls[0][1]['form']['prompt']
+        assert '不要出现任何中文' in calls[0][1]['data']['prompt'] or '绝对不要出现任何中文' in calls[0][1]['data']['prompt']
         assert client.get(f'/api/projects/{pid}').json()['panels'][0]['approved_asset_id'] is None
         candidates=client.get(f'/api/panels/{panel["id"]}/candidates').json()
         assert candidates[0]['id']==asset['id']
