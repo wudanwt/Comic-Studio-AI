@@ -200,7 +200,7 @@ def row_dialogue(d: Dialogue):
     return {"id":d.id,"panel_id":d.panel_id,"speaker_id":d.speaker_id,"text":d.text,"locked":d.locked,"version":d.version,"x":d.x,"y":d.y,"w":d.w,"h":d.h}
 
 def row_panel(p: Panel, db: Session):
-    ds=db.scalars(select(Dialogue).where(Dialogue.panel_id==p.id).order_by(Dialogue.id)).all()
+    ds=db.scalars(select(Dialogue).where(Dialogue.panel_id==p.id).order_by(Dialogue.y,Dialogue.x,Dialogue.id)).all()
     return {"id":p.id,"project_id":p.project_id,"sequence":p.sequence,"scene":p.scene,"camera":p.camera,"approved_asset_id":p.approved_asset_id,"dialogues":[row_dialogue(d) for d in ds]}
 
 def snapshot(db: Session, project_id: str):
