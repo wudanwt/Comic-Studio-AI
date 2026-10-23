@@ -1,0 +1,371 @@
+"""Comic Studio AI API - initial single-workspace MVP.
+
+The v0.1 server is intentionally single-user. Do not expose it to the Internet.
+"""
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
+from hashlib import sha256
+from html import escape
+from io import BytesIO
+import json
+import math
+import os
+from pathlib import Path
+from uuid import uuid4
+
+import cairosvg
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field
+from sqlalchemy import ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./comic_studio.db")
+ASSET_DIR = Path(os.getenv("ASSET_DIR", "./assets")).resolve()
+ASSET_DIR.mkdir(parents=True, exist_ok=True)
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}, pool_pre_ping=True)
+SessionLocal = sessionmaker(engine, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    title: Mapped[str] = mapped_column(String(160))
+    premise: Mapped[str] = mapped_column(Text, default="")
+    style: Mapped[str] = mapped_column(String(120), default="3D动画电影风")
+    panel_count: Mapped[int] = mapped_column(Integer, default=4)
+    outline: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[str] = mapped_column(String(40))
+
+class Character(Base):
+    __tablename__ = "characters"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(100))
+    appearance: Mapped[str] = mapped_column(Text, default="")
+    personality: Mapped[str] = mapped_column(Text, default="")
+    reference_asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+class Panel(Base):
+    __tablename__ = "panels"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    sequence: Mapped[int] = mapped_column(Integer)
+    scene: Mapped[str] = mapped_column(Text, default="")
+    camera: Mapped[str] = mapped_column(String(80), default="中景")
+    approved_asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+class Dialogue(Base):
+    __tablename__ = "dialogues"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    panel_id: Mapped[str] = mapped_column(ForeignKey("panels.id", ondelete="CASCADE"))
+    speaker_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    text: Mapped[str] = mapped_column(Text)
+    locked: Mapped[bool] = mapped_column(default=False)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    x: Mapped[float] = mapped_column(default=.06)
+    y: Mapped[float] = mapped_column(default=.06)
+    w: Mapped[float] = mapped_column(default=.84)
+    h: Mapped[float] = mapped_column(default=.25)
+
+class Asset(Base):
+    __tablename__ = "assets"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    panel_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    path: Mapped[str] = mapped_column(String(300))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    mime: Mapped[str] = mapped_column(String(50), default="image/png")
+    created_at: Mapped[str] = mapped_column(String(40))
+
+class ProjectIn(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    premise: str = ""
+    style: str = "3D动画电影风"
+    panel_count: int = Field(default=4)
+
+class CharacterIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    appearance: str = ""
+    personality: str = ""
+
+class PanelUpdate(BaseModel):
+    scene: str | None = None
+    camera: str | None = None
+
+class DialogueIn(BaseModel):
+    text: str = Field(min_length=1, max_length=300)
+    speaker_id: str | None = None
+    x: float = .06
+    y: float = .06
+    w: float = .84
+    h: float = .25
+
+class DialogueUpdate(BaseModel):
+    text: str | None = Field(default=None, min_length=1, max_length=300)
+    speaker_id: str | None = None
+    x: float | None = None
+    y: float | None = None
+    w: float | None = None
+    h: float | None = None
+
+app = FastAPI(title="Comic Studio AI", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=[os.getenv("WEB_ORIGIN", "http://localhost:5173")], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+def initialize():
+    Base.metadata.create_all(engine)  # v0.1 bootstrap; replace with Alembic migrations
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def require(db: Session, cls, pk):
+    o = db.get(cls, pk)
+    if o is None:
+        raise HTTPException(404, f"{cls.__name__} not found")
+    return o
+
+def row_project(p: Project):
+    return {"id":p.id,"title":p.title,"premise":p.premise,"style":p.style,"panel_count":p.panel_count,"outline":p.outline,"updated_at":p.updated_at}
+
+def row_character(c: Character):
+    return {"id":c.id,"project_id":c.project_id,"name":c.name,"appearance":c.appearance,"personality":c.personality,"reference_asset_id":c.reference_asset_id}
+
+def row_dialogue(d: Dialogue):
+    return {"id":d.id,"panel_id":d.panel_id,"speaker_id":d.speaker_id,"text":d.text,"locked":d.locked,"version":d.version,"x":d.x,"y":d.y,"w":d.w,"h":d.h}
+
+def row_panel(p: Panel, db: Session):
+    ds=db.scalars(select(Dialogue).where(Dialogue.panel_id==p.id).order_by(Dialogue.id)).all()
+    return {"id":p.id,"project_id":p.project_id,"sequence":p.sequence,"scene":p.scene,"camera":p.camera,"approved_asset_id":p.approved_asset_id,"dialogues":[row_dialogue(d) for d in ds]}
+
+def snapshot(db: Session, project_id: str):
+    p=require(db, Project, project_id)
+    cs=db.scalars(select(Character).where(Character.project_id==p.id).order_by(Character.name)).all()
+    ps=db.scalars(select(Panel).where(Panel.project_id==p.id).order_by(Panel.sequence)).all()
+    return {"project":row_project(p),"characters":[row_character(c) for c in cs],"panels":[row_panel(panel,db) for panel in ps]}
+
+@app.get("/api/health")
+def health():
+    return {"status":"ok","version":"0.1.0"}
+
+@app.get("/api/projects")
+def list_projects():
+    with SessionLocal() as db:
+        return [row_project(p) for p in db.scalars(select(Project).order_by(Project.updated_at.desc())).all()]
+
+@app.post("/api/projects", status_code=201)
+def create_project(data: ProjectIn):
+    if data.panel_count not in (4,6,8,12):
+        raise HTTPException(422,"panel_count must be 4, 6, 8, or 12")
+    with SessionLocal.begin() as db:
+        p=Project(id=str(uuid4()),title=data.title,premise=data.premise,style=data.style,panel_count=data.panel_count,updated_at=now())
+        db.add(p)
+        db.flush()
+        for i in range(data.panel_count):
+            db.add(Panel(id=str(uuid4()),project_id=p.id,sequence=i+1,scene=f"第{i+1}格：待设计",camera="中景"))
+        return row_project(p)
+
+@app.get("/api/projects/{project_id}")
+def get_project(project_id: str):
+    with SessionLocal() as db:
+        return snapshot(db,project_id)
+
+@app.post("/api/projects/{project_id}/characters",status_code=201)
+def add_character(project_id: str, data: CharacterIn):
+    with SessionLocal.begin() as db:
+        require(db,Project,project_id)
+        c=Character(id=str(uuid4()),project_id=project_id,**data.model_dump())
+        db.add(c)
+        db.flush()
+        return row_character(c)
+
+@app.patch("/api/characters/{character_id}")
+def edit_character(character_id: str, data: CharacterIn):
+    with SessionLocal.begin() as db:
+        c=require(db,Character,character_id)
+        for k,v in data.model_dump().items():setattr(c,k,v)
+        return row_character(c)
+
+@app.post("/api/projects/{project_id}/story:mock")
+def mock_story(project_id: str):
+    """Deterministic offline storyboard plan. No calls to any model provider."""
+    with SessionLocal.begin() as db:
+        p=require(db,Project,project_id)
+        p.outline=f"围绕「{p.premise or p.title}」展开：起因、发展、冲突、结局。"
+        panels=db.scalars(select(Panel).where(Panel.project_id==p.id).order_by(Panel.sequence)).all()
+        arcs=["交代人物与故事背景","人物产生互动","矛盾逐渐升级","转折并完成结局"]
+        for i,panel in enumerate(panels):
+            panel.scene=f"{arcs[min(3,math.floor(i*4/len(panels)))]}；主题：{p.premise or p.title}"
+        return snapshot(db,project_id)
+
+@app.patch("/api/panels/{panel_id}")
+def edit_panel(panel_id: str,data:PanelUpdate):
+    with SessionLocal.begin() as db:
+        p=require(db,Panel,panel_id)
+        for k,v in data.model_dump(exclude_none=True).items():setattr(p,k,v)
+        return row_panel(p,db)
+
+def check_geometry(d):
+    if not all(math.isfinite(v) for v in (d.x,d.y,d.w,d.h)) or d.x<0 or d.y<0 or d.w<=0 or d.h<=0 or d.x+d.w>1.00001 or d.y+d.h>1.00001:
+        raise HTTPException(422,"bubble coordinates must fit within panel (0..1)")
+
+@app.post("/api/panels/{panel_id}/dialogues",status_code=201)
+def add_dialogue(panel_id: str,data:DialogueIn):
+    check_geometry(data)
+    with SessionLocal.begin() as db:
+        p=require(db,Panel,panel_id)
+        if data.speaker_id:
+            c=require(db,Character,data.speaker_id)
+            if c.project_id!=p.project_id:raise HTTPException(422,"speaker from different project")
+        d=Dialogue(id=str(uuid4()),panel_id=panel_id,**data.model_dump())
+        db.add(d);db.flush()
+        return row_dialogue(d)
+
+@app.patch("/api/dialogues/{dialogue_id}")
+def edit_dialogue(dialogue_id: str,data:DialogueUpdate):
+    with SessionLocal.begin() as db:
+        d=require(db,Dialogue,dialogue_id)
+        if d.locked:raise HTTPException(409,"dialogue is locked; unlock before editing")
+        changed=data.model_dump(exclude_unset=True)
+        for k,v in changed.items():setattr(d,k,v)
+        if not d.text or len(d.text)>300:raise HTTPException(422,"invalid dialogue")
+        check_geometry(d)
+        if d.speaker_id:
+            c=require(db,Character,d.speaker_id)
+            p=require(db,Panel,d.panel_id)
+            if c.project_id!=p.project_id:raise HTTPException(422,"speaker from different project")
+        if changed:d.version+=1
+        return row_dialogue(d)
+
+@app.post("/api/dialogues/{dialogue_id}/lock")
+def lock_dialogue(dialogue_id: str):
+    with SessionLocal.begin() as db:
+        d=require(db,Dialogue,dialogue_id);d.locked=True;return row_dialogue(d)
+
+@app.post("/api/dialogues/{dialogue_id}/unlock")
+def unlock_dialogue(dialogue_id: str):
+    with SessionLocal.begin() as db:
+        d=require(db,Dialogue,dialogue_id);d.locked=False;return row_dialogue(d)
+
+@app.post("/api/panels/{panel_id}/assets",status_code=201)
+async def upload_panel_image(panel_id: str, file: UploadFile = File(...)):
+    with SessionLocal() as db:
+        p=require(db,Panel,panel_id)
+        project_id=p.project_id
+    raw=await file.read(12*1024*1024+1)
+    if len(raw)>12*1024*1024:raise HTTPException(413,"image too large (12MB limit)")
+    try:
+        with Image.open(BytesIO(raw)) as img:
+            img.load()
+            if img.width*img.height>30_000_000:raise HTTPException(413,"image dimensions too large")
+            image=img.convert("RGB")
+            bio=BytesIO();image.save(bio,format="PNG",optimize=True)
+            normalized=bio.getvalue()
+    except (UnidentifiedImageError,OSError,ValueError) as ex:
+        raise HTTPException(415,"invalid raster image") from ex
+    aid=str(uuid4());name=f"{aid}.png"; path=ASSET_DIR/name
+    path.write_bytes(normalized)
+    with SessionLocal.begin() as db:
+        asset=Asset(id=aid,project_id=project_id,panel_id=panel_id,path=name,content_hash=sha256(normalized).hexdigest(),created_at=now())
+        db.add(asset)
+    return {"id":aid,"panel_id":panel_id,"sha256":asset.content_hash}
+
+@app.post("/api/panels/{panel_id}/approve/{asset_id}")
+def approve_asset(panel_id: str,asset_id: str):
+    with SessionLocal.begin() as db:
+        p=require(db,Panel,panel_id)
+        a=require(db,Asset,asset_id)
+        if a.panel_id!=p.id or a.project_id!=p.project_id:raise HTTPException(422,"asset not owned by panel")
+        p.approved_asset_id=a.id
+        return {"panel_id":p.id,"approved_asset_id":a.id}
+
+@app.get("/api/assets/{asset_id}")
+def get_asset(asset_id: str):
+    with SessionLocal() as db:
+        a=require(db,Asset,asset_id)
+        path=ASSET_DIR/a.path
+        if not path.is_file():raise HTTPException(404,"asset data missing")
+        return Response(path.read_bytes(),media_type="image/png")
+
+# Typography: Unicode width is estimated conservatively; overflow rejects rather than clipping.
+def split_zh(text:str, limit:int)->list[str]:
+    result=[];part="";units=0
+    for char in text:
+        size=1 if ord(char)<128 else 2
+        if units+size>limit and part:
+            result.append(part);part="";units=0
+        part+=char;units+=size
+    if part:result.append(part)
+    return result
+
+def render(project_id:str,db:Session,validate:bool=True):
+    data=snapshot(db,project_id)
+    p=data["project"]; panels=data["panels"]
+    columns={4:2,6:3,8:4,12:4}[p["panel_count"]]
+    rows=math.ceil(p["panel_count"]/columns)
+    W,H=1920,1080; pad=30;top=108; gap=16
+    pw=(W-2*pad-(columns-1)*gap)/columns
+    ph=(H-top-pad-(rows-1)*gap)/rows
+    svg=[f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" viewBox="0 0 {W} {H}">',
+         '<rect width="1920" height="1080" fill="#eaf0f7"/>',
+         f'<text x="{W/2}" y="69" font-size="44" text-anchor="middle" fill="#162c4b" font-family="Noto Sans CJK SC,sans-serif" font-weight="700">{escape(p["title"])}</text>']
+    errors=[]
+    for i,panel in enumerate(panels):
+        x=pad+(i%columns)*(pw+gap);y=top+(i//columns)*(ph+gap)
+        svg.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{pw:.2f}" height="{ph:.2f}" rx="10" fill="#ffffff" stroke="#6b87ad" stroke-width="3"/>')
+        if panel["approved_asset_id"]:
+            asset=db.get(Asset,panel["approved_asset_id"])
+            if not asset or asset.panel_id!=panel["id"]:errors.append(f'第{i+1}格：关联图片无效')
+            elif not (ASSET_DIR/asset.path).is_file():errors.append(f'第{i+1}格：图片文件缺失')
+            else:
+                payload=base64.b64encode((ASSET_DIR/asset.path).read_bytes()).decode()
+                svg.append(f'<svg x="{x+3:.2f}" y="{y+3:.2f}" width="{pw-6:.2f}" height="{ph-6:.2f}" viewBox="0 0 1000 1000" preserveAspectRatio="xMidYMid slice"><image width="1000" height="1000" preserveAspectRatio="xMidYMid slice" href="data:image/png;base64,{payload}"/></svg>')
+        else:
+            svg.append(f'<text x="{x+pw/2:.2f}" y="{y+ph/2:.2f}" text-anchor="middle" fill="#9daaba" font-size="28" font-family="Noto Sans CJK SC,sans-serif">{i+1} / 待上传画面</text>')
+        boxes=[]
+        for j,d in enumerate(panel["dialogues"]):
+            bx=x+d["x"]*pw;by=y+d["y"]*ph;bw=d["w"]*pw;bh=d["h"]*ph
+            fs=min(30,max(17,round(min(pw,ph)*.067)))
+            line_height=fs*1.35;limit=max(1,math.floor((bw-34)/fs*2))
+            lines=split_zh(d["text"],limit)
+            if 18+len(lines)*line_height>bh:errors.append(f'第{i+1}格第{j+1}气泡：中文文字超框')
+            if bx<x-0.001 or by<y-0.001 or bx+bw>x+pw+0.001 or by+bh>y+ph+0.001:errors.append(f'第{i+1}格第{j+1}气泡：位置越界')
+            for prev in boxes:
+                if bx<prev[0]+prev[2] and bx+bw>prev[0] and by<prev[1]+prev[3] and by+bh>prev[1]:errors.append(f'第{i+1}格第{j+1}气泡：与其他气泡重叠')
+            boxes.append((bx,by,bw,bh))
+            svg.append(f'<rect x="{bx:.2f}" y="{by:.2f}" width="{bw:.2f}" height="{bh:.2f}" rx="19" fill="#ffffff" fill-opacity=".96" stroke="#1a2945" stroke-width="3"/>')
+            for k,line in enumerate(lines):
+                ly=by+18+fs+(k*line_height)
+                svg.append(f'<text x="{bx+17:.2f}" y="{ly:.2f}" font-family="Noto Sans CJK SC,sans-serif" font-size="{fs}" fill="#17243a">{escape(line)}</text>')
+    svg.append('</svg>')
+    if validate and errors:raise HTTPException(422,{"errors":errors})
+    return "".join(svg),errors
+
+@app.get("/api/projects/{project_id}/validate")
+def validate_composition(project_id:str):
+    with SessionLocal() as db:
+        _,errors=render(project_id,db,validate=False)
+    return {"valid":not bool(errors),"errors":errors}
+
+@app.get("/api/projects/{project_id}/export.svg")
+def export_svg(project_id:str):
+    with SessionLocal() as db: svg,_=render(project_id,db)
+    return Response(svg,media_type="image/svg+xml",headers={"Content-Disposition":"attachment; filename=comic.svg"})
+
+@app.get("/api/projects/{project_id}/export.png")
+def export_png(project_id:str):
+    with SessionLocal() as db: svg,_=render(project_id,db)
+    try: png=cairosvg.svg2png(bytestring=svg.encode("utf-8"))
+    except Exception as ex:raise HTTPException(500,"PNG rendering failed") from ex
+    return Response(png,media_type="image/png",headers={"Content-Disposition":"attachment; filename=comic.png"})
+
+@app.get("/api/projects/{project_id}/export.json")
+def export_json(project_id:str):
+    with SessionLocal() as db: data=snapshot(db,project_id)
+    return Response(json.dumps(data,ensure_ascii=False,indent=2),media_type="application/json",headers={"Content-Disposition":"attachment; filename=comic.json"})
