@@ -1,4 +1,5 @@
 import {useEffect,useState} from 'react';
+import {GenerationJobPanel} from './StudioV3';
 import {BookOpen,CheckCircle2,Image as ImageIcon,RefreshCw,ShieldCheck,Upload,WandSparkles} from 'lucide-react';
 
 type Action=(op:()=>Promise<void>)=>Promise<void>;
@@ -72,7 +73,7 @@ export function StoryAI({projectId,action,onChanged}:{projectId:string;action:Ac
  </div>;
 }
 
-export function PanelAI({panelId,characters,action,onChanged}:{panelId:string;characters:Character[];action:Action;onChanged:()=>Promise<void>}){
+export function PanelAI({projectId,panelId,characters,action,onChanged}:{projectId:string;panelId:string;characters:Character[];action:Action;onChanged:()=>Promise<void>}){
  const [candidates,setCandidates]=useState<Candidate[]>([]);
  const [selected,setSelected]=useState<string[]>([]);
  const [override,setOverride]=useState('');
@@ -82,15 +83,11 @@ export function PanelAI({panelId,characters,action,onChanged}:{panelId:string;ch
  useEffect(()=>{setCandidates([]);setError('');setLastInfo('');setSelected([]);setOverride('');reload().catch(e=>setError(String(e)));},[panelId]);
  return <div className="ai-module">
    <h3><ImageIcon size={17}/> AI 单格生图与候选审核</h3>
-   <p className="hint">自动引用当前分镜的场景、景别、画风和角色描述；额外提示词只影响当前画格。生成图片不包含任何对白文字。</p>
+   <p className="hint">从场景、景别、人设创建冻结提示词，提交后台生图任务；图片不含对白，采用候选后单独叠字。</p>
    <label>本格出场角色（全部不选时使用项目所有角色）</label>
    <div className="ai-cast">{characters.map(c=><label key={c.id}><input type="checkbox" checked={selected.includes(c.id)} onChange={e=>setSelected(a=>e.target.checked?[...a,c.id]:a.filter(x=>x!==c.id))}/>{c.name}{c.reference_asset_id?' · 有参考图':''}</label>)}</div>
    <label>补充画面提示词（可选）</label><textarea rows={3} maxLength={2000} value={override} onChange={e=>setOverride(e.target.value)} placeholder="例如：保留更多上方留白，人物惊讶的表情特写"/>
-   <button className="primary" onClick={()=>void action(async()=>{
-     const result=await req<{id:string;reference_count:number}>('/panels/'+panelId+'/generate:ai',requestJson({character_ids:selected,prompt_override:override}));
-     setLastInfo('生成候选图完成，使用参考图 '+result.reference_count+' 张。需要手动审核并采用。');
-     await reload();
-   })}><WandSparkles size={16}/> 使用真实模型生成候选图</button>
+   <GenerationJobPanel projectId={projectId} panelId={panelId} selectedCharacters={selected} override={override} action={action} onChanged={async()=>{await Promise.all([reload(),onChanged()]);}}/>
    {error&&<p className="ai-error">{error}</p>}{lastInfo&&<p className="hint">{lastInfo}</p>}
    <div className="candidate-list">{candidates.map(c=><div key={c.id} className="candidate"><img src={c.url} alt="AI候选图"/><div className="line spread"><small>{c.id.slice(0,8)}</small>{c.approved?<span className="tag good"><ShieldCheck size={12}/> 已采用</span>:<button className="secondary small" onClick={()=>void action(async()=>{await req('/panels/'+panelId+'/approve/'+c.id,requestJson());await Promise.all([reload(),onChanged()]);})}><CheckCircle2 size={14}/> 采用</button>}</div></div>)}</div>
    <button className="secondary small" onClick={()=>void reload()}><RefreshCw size={14}/> 刷新候选</button>
