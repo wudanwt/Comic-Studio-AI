@@ -54,3 +54,24 @@ def test_validation_and_authorization_constraints():
         assert client.patch(f'/api/dialogues/{d["id"]}',json={'text':'错字检查：中文，精准！'}).status_code==200
         assert '错字检查：中文，精准！' in client.get(f'/api/projects/{p["id"]}/export.svg').text
         assert client.post(f'/api/panels/{panel["id"]}/assets',files={'file':('test.txt',b'not image','text/plain')}).status_code==415
+
+
+def test_mock_generation_is_per_panel_and_does_not_render_chinese_in_image():
+    with TestClient(app) as client:
+        project=client.post('/api/projects',json={'title':'示例测试','panel_count':4}).json()
+        pid=project['id']
+        panels=client.get(f'/api/projects/{pid}').json()['panels']
+        manifest=client.get('/api/providers').json()
+        assert manifest[0]['capabilities']['offline_mock'] is True
+        assert manifest[0]['capabilities']['generates_text'] is False
+        a=client.post(f'/api/panels/{panels[1]["id"]}/generate:mock')
+        assert a.status_code==201
+        aid=a.json()['id']
+        assert client.get(f'/api/assets/{aid}').content[:8]==b'\x89PNG\r\n\x1a\n'
+        before=client.get(f'/api/projects/{pid}').json()['panels']
+        assert all(p['approved_asset_id'] is None for p in before)
+        client.post(f'/api/panels/{panels[1]["id"]}/approve/{aid}')
+        after=client.get(f'/api/projects/{pid}').json()['panels']
+        assert after[1]['approved_asset_id']==aid
+        assert after[0]['approved_asset_id'] is None
+        assert after[2]['approved_asset_id'] is None
