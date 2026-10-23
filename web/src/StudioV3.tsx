@@ -5,7 +5,7 @@ import {Check,Clock3,ImagePlus,Move,RefreshCw,RotateCcw,ShieldCheck,SquareArrowO
 type Action=(f:()=>Promise<void>)=>Promise<void>;
 interface Reference {id:string;asset_id:string;character_id:string;angle:string;note:string;created_at:string}
 interface Job {id:string;panel_id:string;status:string;provider:string;attempt:number;max_attempts:number;candidate_asset_id:string|null;error_code:string|null}
-interface Dialogue {id:string;text:string;locked:boolean;x:number;y:number;w:number;h:number}
+interface Dialogue {id:string;text:string;locked:boolean;version:number;x:number;y:number;w:number;h:number}
 interface Panel {id:string;approved_asset_id:string|null;dialogues:Dialogue[]}
 
 async function request<T>(path:string,init:RequestInit={}):Promise<T>{
