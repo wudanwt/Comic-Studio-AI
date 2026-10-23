@@ -218,6 +218,8 @@ def apply_story_draft(draft_id: str):
         existing=db.scalars(select(Dialogue).where(Dialogue.panel_id.in_([p.id for p in panels]))).all()
         if existing:
             raise HTTPException(409,"Project has existing dialogue; use a new project to apply AI draft without data loss")
+        if project.outline.strip() or any(p.scene != f"第{p.sequence}格：待设计" or p.camera != "中景" for p in panels):
+            raise HTTPException(409,"Project has manually planned story content; refusing to overwrite it")
         payload=json.loads(draft.payload)
         cast=db.scalars(select(Character).where(Character.project_id==project.id)).all()
         name_to_id={c.name:c.id for c in cast}
