@@ -44,7 +44,7 @@ def test_story_panel_text_export_isolation():
         assert '我昨天就出发了！' in client.get(f'/api/projects/{pid}/export.svg').text
         png=client.get(f'/api/projects/{pid}/export.png')
         assert png.status_code==200 and png.content[:8]==b'\x89PNG\r\n\x1a\n'
-        assert client.get(f'/api/projects/{pid}/export.json').json()['panels'][2]['dialogues'][0]['text']=='我昨天就出发了！'
+        assert any(item['id']==d['id'] and item['text']=='我昨天就出发了！' for item in client.get(f'/api/projects/{pid}/export.json').json()['panels'][2]['dialogues'])
 
 
 def test_validation_and_authorization_constraints():

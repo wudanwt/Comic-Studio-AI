@@ -23,7 +23,7 @@ from PIL import Image, UnidentifiedImageError
 from providers import MockImageProvider, provider_manifest
 import ai_pipeline
 from pydantic import BaseModel, Field
-from sqlalchemy import ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy import ForeignKey, Integer, String, Text, create_engine, select, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./comic_studio.db")
@@ -95,6 +95,49 @@ class StoryDraft(Base):
     created_at: Mapped[str] = mapped_column(String(40))
 
 
+class CharacterReference(Base):
+    """Versioned references; never overwrite an earlier image, including after selecting a new active asset."""
+    __tablename__ = "character_references"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    character_id: Mapped[str] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+    asset_id: Mapped[str] = mapped_column(ForeignKey("assets.id"))
+    angle: Mapped[str] = mapped_column(String(24))
+    note: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
+class GenerationJob(Base):
+    """Durable jobs. One worker leases one job using SELECT FOR UPDATE SKIP LOCKED on PostgreSQL."""
+    __tablename__ = "generation_jobs"
+    __table_args__ = (UniqueConstraint("project_id","request_key",name="uq_job_project_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id",ondelete="CASCADE"))
+    panel_id: Mapped[str] = mapped_column(ForeignKey("panels.id",ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String(24),default="queued")
+    provider: Mapped[str] = mapped_column(String(24),default="mock")
+    prompt: Mapped[str] = mapped_column(Text)
+    references: Mapped[str] = mapped_column(Text,default="[]")
+    request_key: Mapped[str] = mapped_column(String(100))
+    attempt: Mapped[int] = mapped_column(Integer,default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer,default=2)
+    candidate_asset_id: Mapped[str|None] = mapped_column(String(36),nullable=True)
+    error_code: Mapped[str|None] = mapped_column(String(100),nullable=True)
+    created_at: Mapped[str] = mapped_column(String(40))
+    updated_at: Mapped[str] = mapped_column(String(40))
+
+
+class QueueImageIn(BaseModel):
+    provider: str = "mock"
+    character_ids: list[str] = Field(default_factory=list,max_length=8)
+    prompt_override: str = Field(default="",max_length=2000)
+    request_key: str|None = Field(default=None,min_length=1,max_length=100)
+
+
+class ReferenceMeta(BaseModel):
+    angle: str = "front"
+    note: str = Field(default="",max_length=300)
+
+
 class ImageGenerateIn(BaseModel):
     character_ids: list[str] = Field(default_factory=list, max_length=8)
     prompt_override: str = Field(default="", max_length=2000)
@@ -157,7 +200,7 @@ def row_dialogue(d: Dialogue):
     return {"id":d.id,"panel_id":d.panel_id,"speaker_id":d.speaker_id,"text":d.text,"locked":d.locked,"version":d.version,"x":d.x,"y":d.y,"w":d.w,"h":d.h}
 
 def row_panel(p: Panel, db: Session):
-    ds=db.scalars(select(Dialogue).where(Dialogue.panel_id==p.id).order_by(Dialogue.id)).all()
+    ds=db.scalars(select(Dialogue).where(Dialogue.panel_id==p.id).order_by(Dialogue.y,Dialogue.x,Dialogue.id)).all()
     return {"id":p.id,"project_id":p.project_id,"sequence":p.sequence,"scene":p.scene,"camera":p.camera,"approved_asset_id":p.approved_asset_id,"dialogues":[row_dialogue(d) for d in ds]}
 
 def snapshot(db: Session, project_id: str):
@@ -169,6 +212,18 @@ def snapshot(db: Session, project_id: str):
 @app.get("/api/providers")
 def list_providers():
     return provider_manifest()
+
+def row_reference(r:CharacterReference):
+    return {"id":r.id,"character_id":r.character_id,"asset_id":r.asset_id,
+            "angle":r.angle,"note":r.note,"created_at":r.created_at}
+
+
+def row_job(j:GenerationJob):
+    return {"id":j.id,"project_id":j.project_id,"panel_id":j.panel_id,
+            "status":j.status,"provider":j.provider,"attempt":j.attempt,
+            "max_attempts":j.max_attempts,"candidate_asset_id":j.candidate_asset_id,
+            "error_code":j.error_code,"created_at":j.created_at,"updated_at":j.updated_at}
+
 
 @app.get("/api/ai/status")
 def get_ai_status():
@@ -262,6 +317,132 @@ async def set_character_reference(character_id: str,file:UploadFile=File(...)):
                      content_hash=sha256(normalized).hexdigest(),created_at=now()))
         character.reference_asset_id=asset_id
         return {"character_id":character_id,"reference_asset_id":asset_id}
+
+
+@app.get("/api/characters/{character_id}/references")
+def get_character_references(character_id:str):
+    with SessionLocal() as db:
+        require(db,Character,character_id)
+        refs=db.scalars(select(CharacterReference).where(CharacterReference.character_id==character_id).order_by(CharacterReference.created_at.desc(),CharacterReference.id.desc())).all()
+        return [row_reference(ref) for ref in refs]
+
+
+@app.post("/api/characters/{character_id}/references",status_code=201)
+async def upload_character_reference_version(character_id:str,file:UploadFile=File(...),angle:str="front",note:str=""):
+    if angle not in {"front","side","back","expression","outfit"}:
+        raise HTTPException(422,"angle must be front, side, back, expression or outfit")
+    if len(note)>300:raise HTTPException(422,"note too long")
+    with SessionLocal() as db:
+        c=require(db,Character,character_id)
+        project_id=c.project_id
+    try:
+        raw=await file.read(ai_pipeline.MAX_IMAGE_BYTES+1)
+        normalized=ai_pipeline.normalize_png(raw)
+    except ai_pipeline.AIProviderError as exc:
+        raise HTTPException(415,str(exc)) from exc
+    aid=str(uuid4());filename=f"{aid}.png"
+    (ASSET_DIR/filename).write_bytes(normalized)
+    with SessionLocal.begin() as db:
+        character=require(db,Character,character_id)
+        db.add(Asset(id=aid,project_id=project_id,panel_id=None,path=filename,content_hash=sha256(normalized).hexdigest(),created_at=now()))
+        ref=CharacterReference(id=str(uuid4()),character_id=character.id,asset_id=aid,angle=angle,note=note,created_at=now())
+        db.add(ref)
+        if not character.reference_asset_id:character.reference_asset_id=aid
+        db.flush()
+        return row_reference(ref)
+
+
+@app.post("/api/characters/{character_id}/references/{reference_id}/activate")
+def activate_character_reference(character_id:str,reference_id:str):
+    with SessionLocal.begin() as db:
+        character=require(db,Character,character_id)
+        ref=require(db,CharacterReference,reference_id)
+        if ref.character_id!=character.id:raise HTTPException(422,"reference belongs to another character")
+        asset=require(db,Asset,ref.asset_id)
+        if asset.project_id!=character.project_id or asset.panel_id is not None:
+            raise HTTPException(422,"reference asset ownership mismatch")
+        character.reference_asset_id=ref.asset_id
+        return {"character_id":character_id,"reference_asset_id":ref.asset_id,"reference_id":ref.id}
+
+
+def build_job_payload(db:Session, panel:Panel, data:QueueImageIn):
+    project=require(db,Project,panel.project_id)
+    if len(set(data.character_ids))!=len(data.character_ids):raise HTTPException(422,"duplicate character ids")
+    if data.character_ids:
+        characters=[require(db,Character,cid) for cid in data.character_ids]
+        if any(c.project_id!=project.id for c in characters):raise HTTPException(422,"character from another project")
+    else:
+        characters=db.scalars(select(Character).where(Character.project_id==project.id).order_by(Character.name)).all()
+    cast=[{"name":c.name,"appearance":c.appearance,"personality":c.personality} for c in characters]
+    prompt=ai_pipeline.build_panel_prompt(panel.scene,panel.camera,project.style,cast,data.prompt_override)
+    refs=[]
+    if data.provider=="ai" and ai_pipeline.reference_mode()=="edits":
+        for c in characters:
+            if c.reference_asset_id:
+                asset=require(db,Asset,c.reference_asset_id)
+                if asset.project_id!=project.id or asset.panel_id is not None:
+                    raise HTTPException(422,"invalid character reference")
+                refs.append(asset.id)
+        if len(refs)>3:raise HTTPException(422,"maximum 3 reference images")
+    return prompt,refs
+
+
+@app.post("/api/panels/{panel_id}/jobs",status_code=202)
+def enqueue_image_job(panel_id:str,data:QueueImageIn):
+    if data.provider not in ("mock","ai"):raise HTTPException(422,"provider must be mock or ai")
+    if data.provider=="ai" and not ai_pipeline.capability_status()["image"]["ready"]:
+        raise HTTPException(422,"image provider not configured")
+    request_key=data.request_key or str(uuid4())
+    with SessionLocal.begin() as db:
+        panel=require(db,Panel,panel_id)
+        existing=db.scalars(select(GenerationJob).where(GenerationJob.project_id==panel.project_id,GenerationJob.request_key==request_key)).first()
+        if existing:
+            if existing.panel_id!=panel.id or existing.provider!=data.provider:
+                raise HTTPException(409,"request key reused for another job")
+            return row_job(existing)
+        pending=db.scalar(select(func.count()).select_from(GenerationJob).where(
+            GenerationJob.project_id==panel.project_id,
+            GenerationJob.status.in_(["queued","running"])))
+        if pending is not None and pending>=32:raise HTTPException(429,"project pending job quota reached")
+        prompt,refs=build_job_payload(db,panel,data)
+        job=GenerationJob(id=str(uuid4()),project_id=panel.project_id,panel_id=panel.id,
+                          status="queued",provider=data.provider,prompt=prompt,references=json.dumps(refs),
+                          request_key=request_key,created_at=now(),updated_at=now())
+        db.add(job);db.flush()
+        return row_job(job)
+
+
+@app.get("/api/projects/{project_id}/jobs")
+def list_generation_jobs(project_id:str):
+    with SessionLocal() as db:
+        require(db,Project,project_id)
+        jobs=db.scalars(select(GenerationJob).where(GenerationJob.project_id==project_id).order_by(GenerationJob.created_at.desc())).all()
+        return [row_job(job) for job in jobs[:100]]
+
+
+@app.get("/api/jobs/{job_id}")
+def get_generation_job(job_id:str):
+    with SessionLocal() as db:
+        return row_job(require(db,GenerationJob,job_id))
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_generation_job(job_id:str):
+    with SessionLocal.begin() as db:
+        job=require(db,GenerationJob,job_id)
+        if job.status in ("queued","running"):
+            job.status="cancelled";job.updated_at=now()
+        return row_job(job)
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_generation_job(job_id:str):
+    with SessionLocal.begin() as db:
+        job=require(db,GenerationJob,job_id)
+        if job.status!="failed":raise HTTPException(409,"only failed jobs may be retried")
+        if job.attempt>=job.max_attempts:raise HTTPException(409,"maximum attempts reached")
+        job.status="queued";job.error_code=None;job.updated_at=now()
+        return row_job(job)
 
 
 @app.get("/api/panels/{panel_id}/candidates")
@@ -408,8 +589,9 @@ def add_dialogue(panel_id: str,data:DialogueIn):
 def edit_dialogue(dialogue_id: str,data:DialogueUpdate):
     with SessionLocal.begin() as db:
         d=require(db,Dialogue,dialogue_id)
-        if d.locked:raise HTTPException(409,"dialogue is locked; unlock before editing")
         changed=data.model_dump(exclude_unset=True)
+        if d.locked and ("text" in changed or "speaker_id" in changed):
+            raise HTTPException(409,"locked dialogue text or speaker cannot be edited")
         for k,v in changed.items():setattr(d,k,v)
         if not d.text or len(d.text)>300:raise HTTPException(422,"invalid dialogue")
         check_geometry(d)

@@ -1,5 +1,6 @@
 import React, {useCallback, useEffect, useState} from 'react';
-import {AIStatusPanel,CharacterReference,PanelAI,StoryAI} from './AIFeatures';
+import {AIStatusPanel,PanelAI,StoryAI} from './AIFeatures';
+import {BubbleCanvas,VersionedCharacterReferences} from './StudioV3';
 import {BookOpen, Clapperboard, Download, FileText, Film, Image as ImageIcon, LayoutGrid, Lock, LockOpen, Plus, RefreshCw, Save, Settings, ShieldCheck, Sparkles, Upload, Users} from 'lucide-react';
 
 type Nav = 'projects' | 'characters' | 'story' | 'panels' | 'compose' | 'settings';
@@ -128,7 +129,7 @@ export default function App() {
           <label>性格与说话方式</label><textarea rows={3} value={characterForm.personality} onChange={e=>setCharacterForm({...characterForm,personality:e.target.value})} placeholder="例如：骄傲、嘴硬、喜欢吐槽"/>
           <button className="primary" disabled={busy||!characterForm.name.trim()} onClick={createCharacter}><Plus size={16}/> 保存角色</button>
         </div>
-        <div className="surface"><h2>角色列表 <span className="muted">({current.characters.length})</span></h2>{current.characters.length?current.characters.map(c=><div className="character" key={c.id}><div className="avatar">{c.name.slice(0,1)}</div><div><strong>{c.name}</strong><p>{c.appearance||'尚未填写外观'}</p><small>{c.personality||'尚未填写性格'}</small><CharacterReference character={c} action={act} onChanged={changed}/></div></div>):<div className="empty">还没有角色，先建立角色档案。</div>}<p className="hint">定妆照及角色版本锁定将在下一阶段实现。</p></div>
+        <div className="surface"><h2>角色列表 <span className="muted">({current.characters.length})</span></h2>{current.characters.length?current.characters.map(c=><div className="character" key={c.id}><div className="avatar">{c.name.slice(0,1)}</div><div><strong>{c.name}</strong><p>{c.appearance||'尚未填写外观'}</p><small>{c.personality||'尚未填写性格'}</small><VersionedCharacterReferences characterId={c.id} activeAsset={c.reference_asset_id} action={act} onChanged={changed}/></div></div>):<div className="empty">还没有角色，先建立角色档案。</div>}<p className="hint">定妆照及角色版本锁定将在下一阶段实现。</p></div>
       </section>}
       {nav==='story'&&current&&<section className="surface"><h2><BookOpen size={20}/> 剧情工坊</h2><p className="hint">当前实现离线 Mock 分镜规划，不会调用付费模型，也不会覆盖已保存的对白和图片。</p>
         <div className="readout"><span className="muted">项目题材</span><p>{current.project.premise||current.project.title}</p><span className="muted">创作风格</span><p>{current.project.style}</p></div>
@@ -139,7 +140,7 @@ export default function App() {
       </section>}
       {nav==='panels'&&current&&<section className="workbench">
         <div className="surface"><h2><LayoutGrid size={20}/> 画格列表</h2><div className="panel-list">{current.panels.map(p=><button key={p.id} className={'panel-tile '+(p.id===selectedPanel?'selected':'')} onClick={()=>setSelectedPanel(p.id)}>{p.approved_asset_id?<img src={'/api/assets/'+p.approved_asset_id} alt={'第'+p.sequence+'格'} />:<div className="panel-placeholder"><ImageIcon size={24}/></div>}<span>第 {p.sequence} 格 <small>{p.dialogues.length}条对白</small></span></button>)}</div></div>
-        <div className="surface">{panel&&<><h2>第 {panel.sequence} 格 · 详细编辑</h2>
+        <div className="surface">{panel&&<><h2>第 {panel.sequence} 格 · 详细编辑</h2><BubbleCanvas panel={panel} action={act} onChanged={changed}/>
           <label>场景与人物动作</label><textarea rows={3} value={scene} onChange={e=>setScene(e.target.value)}/>
           <label>镜头景别</label><select value={camera} onChange={e=>setCamera(e.target.value)}>{['远景','全景','中景','近景','特写','俯拍','仰拍'].map(s=><option key={s}>{s}</option>)}</select>
           <button className="secondary" disabled={busy} onClick={()=>act(async()=>{await api('/panels/'+panel.id,json('PATCH',{scene,camera}));await changed();})}><Save size={16}/> 保存分镜</button>
@@ -151,7 +152,7 @@ export default function App() {
         </>}</div>
         <div className="surface"><h2><FileText size={20}/> 中文对白</h2>{panel&&<><p className="hint">对白存储与图片分离，导出时使用真实中文字形绘制。</p>
           {panel.dialogues.map(d=><DialogueEditor key={d.id} data={d} characters={current.characters} changed={changed} action={act}/>)}
-          <PanelAI panelId={panel.id} characters={current.characters} action={act} onChanged={changed}/>
+          <PanelAI projectId={current.project.id} panelId={panel.id} characters={current.characters} action={act} onChanged={changed}/>
           <h3>新增对白</h3><label>说话角色</label><select value={dialogueSpeaker} onChange={e=>setDialogueSpeaker(e.target.value)}><option value="">旁白 / 未指定</option>{current.characters.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
           <label>中文台词</label><textarea rows={3} value={dialogueText} maxLength={300} placeholder="请填写准确的中文对白…" onChange={e=>setDialogueText(e.target.value)}/>
           <button className="primary" disabled={busy||!dialogueText.trim()} onClick={()=>act(async()=>{await api('/panels/'+panel.id+'/dialogues',json('POST',{text:dialogueText,speaker_id:dialogueSpeaker||null}));setDialogueText('');await changed();})}><Plus size={16}/> 添加对白</button>
@@ -169,7 +170,7 @@ export default function App() {
         <p className="hint">当前提供固定网格和位置参数编辑。拖拽式画布、图层与可视化气泡尾巴将在后续版本提供。</p>
       </section>}
       {nav==='settings'&&<section className="surface"><h2><Settings size={20}/> 模型接入与运行状态</h2><AIStatusPanel/><div className="readout"><strong>运行模式：离线 Mock / 已配置的真实模型</strong><p>不配置模型时仍可上传画格图片或生成 Mock 插画；配置后可使用真实 AI 剧本与画格生成。</p><p>已提供真实 LLM 和 Images API 模型适配器，可通过服务端环境变量连接；ComfyUI 与 GPU Worker 尚未接入。</p></div><h3>计划中的模型能力</h3><div className="chapter-list">{['结构化剧本模型：需配置环境变量','生图接口：需配置环境变量与参考模式','局部重绘：角色与画面修正','多Worker任务队列与进度追踪'].map(x=><div className="chapter" key={x}><span>待开发</span>{x}</div>)}</div></section>}
-      <footer>Comic Studio AI · v0.2 单用户开发版 · 未配置登录与访问控制，请仅在本机或可信网络使用。</footer>
+      <footer>Comic Studio AI · v0.3 单用户开发版 · 未配置登录与访问控制，请仅在本机或可信网络使用。</footer>
     </main>
   </div>;
 }
