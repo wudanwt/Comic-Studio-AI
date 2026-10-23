@@ -20,6 +20,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image, UnidentifiedImageError
+from providers import MockImageProvider, provider_manifest
 from pydantic import BaseModel, Field
 from sqlalchemy import ForeignKey, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -150,6 +151,10 @@ def snapshot(db: Session, project_id: str):
     ps=db.scalars(select(Panel).where(Panel.project_id==p.id).order_by(Panel.sequence)).all()
     return {"project":row_project(p),"characters":[row_character(c) for c in cs],"panels":[row_panel(panel,db) for panel in ps]}
 
+@app.get("/api/providers")
+def list_providers():
+    return provider_manifest()
+
 @app.get("/api/health")
 def health():
     return {"status":"ok","version":"0.1.0"}
@@ -275,6 +280,23 @@ async def upload_panel_image(panel_id: str, file: UploadFile = File(...)):
         asset=Asset(id=aid,project_id=project_id,panel_id=panel_id,path=name,content_hash=sha256(normalized).hexdigest(),created_at=now())
         db.add(asset)
     return {"id":aid,"panel_id":panel_id,"sha256":asset.content_hash}
+
+@app.post("/api/panels/{panel_id}/generate:mock",status_code=201)
+def generate_mock_panel(panel_id: str):
+    """Offline illustrative Mock image. Creates a candidate, not an approval."""
+    with SessionLocal() as db:
+        panel=require(db,Panel,panel_id)
+        project=require(db,Project,panel.project_id)
+        project_id=project.id
+        sequence=panel.sequence
+        count=project.panel_count
+    generated=MockImageProvider().generate(sequence,count,panel_id)
+    aid=str(uuid4())
+    filename=f"{aid}.png"
+    (ASSET_DIR/filename).write_bytes(generated)
+    with SessionLocal.begin() as db:
+        db.add(Asset(id=aid,project_id=project_id,panel_id=panel_id,path=filename,content_hash=sha256(generated).hexdigest(),created_at=now()))
+    return {"id":aid,"panel_id":panel_id,"mock":True}
 
 @app.post("/api/panels/{panel_id}/approve/{asset_id}")
 def approve_asset(panel_id: str,asset_id: str):
