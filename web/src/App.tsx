@@ -156,7 +156,7 @@ export default function App() {
       </section>}
       {nav==='compose'&&current&&<section className="surface"><div className="line spread"><h2><Clapperboard size={20}/> 漫画合成</h2><span className="pill">1920 × 1080 · {current.project.panel_count}格</span></div>
         <p className="hint">服务端按固定布局将批准画面与原始中文对白合成；检查文字超框、气泡越界和重叠。</p>
-        <div className="line"><button className="primary" onClick={()=>act(async()=>{setValidation(await api('/projects/'+current.project.id+'/validate'));})}><ShieldCheck size={17}/> 检查排版</button>
+        <div className="line"><button className="secondary" disabled={busy} onClick={()=>act(async()=>{for(const p of current.panels){if(!p.approved_asset_id){const asset=await api<{id:string}>('/panels/'+p.id+'/generate:mock',json('POST'));await api('/panels/'+p.id+'/approve/'+asset.id,json('POST'));}}await changed();})}><Sparkles size={17}/> 一键生成缺失的示例画格</button><button className="primary" onClick={()=>act(async()=>{setValidation(await api('/projects/'+current.project.id+'/validate'));})}><ShieldCheck size={17}/> 检查排版</button>
           <a className="secondary button-link" href={'/api/projects/'+current.project.id+'/export.svg'}><Download size={17}/> SVG</a>
           <a className="secondary button-link" href={'/api/projects/'+current.project.id+'/export.png'}><Download size={17}/> PNG</a>
           <a className="secondary button-link" href={'/api/projects/'+current.project.id+'/export.json'}><Download size={17}/> JSON</a>
