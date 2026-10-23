@@ -143,6 +143,7 @@ export default function App() {
           <button className="secondary" disabled={busy} onClick={()=>act(async()=>{await api('/panels/'+panel.id,json('PATCH',{scene,camera}));await changed();})}><Save size={16}/> 保存分镜</button>
           <div className="section-head"><h3>逐格画面</h3><span className="pill">{panel.approved_asset_id?'已有批准图片':'尚无图片'}</span></div>
           {panel.approved_asset_id&&<img className="scene-image" src={'/api/assets/'+panel.approved_asset_id} alt="当前画格"/>}
+          <button className="secondary" disabled={busy} onClick={()=>act(async()=>{const asset=await api<{id:string}>('/panels/'+panel.id+'/generate:mock',json('POST'));await api('/panels/'+panel.id+'/approve/'+asset.id,json('POST'));await changed();})}><Sparkles size={16}/> 生成无字示例插画（Mock）</button>
           <label className="upload"><Upload size={17}/> 上传并采用无字画面<input type="file" accept="image/png,image/jpeg,image/webp" onChange={e=>{const file=e.target.files?.[0];if(file)void upload(file);e.target.value='';}}/></label>
           <p className="hint">图片为独立资产。更改台词时不会重新生成图片；上传新图只替换当前画格。</p>
         </>}</div>
