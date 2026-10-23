@@ -589,8 +589,9 @@ def add_dialogue(panel_id: str,data:DialogueIn):
 def edit_dialogue(dialogue_id: str,data:DialogueUpdate):
     with SessionLocal.begin() as db:
         d=require(db,Dialogue,dialogue_id)
-        if d.locked:raise HTTPException(409,"dialogue is locked; unlock before editing")
         changed=data.model_dump(exclude_unset=True)
+        if d.locked and ("text" in changed or "speaker_id" in changed):
+            raise HTTPException(409,"locked dialogue text or speaker cannot be edited")
         for k,v in changed.items():setattr(d,k,v)
         if not d.text or len(d.text)>300:raise HTTPException(422,"invalid dialogue")
         check_geometry(d)
